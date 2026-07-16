@@ -25,7 +25,10 @@ import {
   Inbox,
 } from 'lucide-react'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+// Vite bakes this in at build time. Dev server falls back to the local backend port;
+// the Docker/nginx production build sets it to "" so requests go to the same
+// origin the page is served from and nginx proxies /api/* to the backend container.
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 const REFRESH_INTERVAL_MS = 20000
 const APPLIANCE_KEYWORDS = ['냉장고', '세탁기', '에어컨', '공기청정기', 'TV']
 

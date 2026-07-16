@@ -37,20 +37,28 @@ Claude 연동 가이드 - 카카오 MCP 알림 브릿지 (사람이 읽는 운�
 """
 
 import asyncio
+import logging
 import os
 import sqlite3
 import statistics
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import NoReturn, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("lcoup_direct")
 
 DB_PATH = os.getenv("DB_PATH", "lcoup_direct.db")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
@@ -158,6 +166,22 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    예상하지 못한 예외가 요청 처리 중 발생해도 프로세스 전체가 죽지 않고
+    이 핸들러가 잡아 로그를 남긴 뒤 500 JSON 응답으로 정리한다.
+    """
+    logger.exception("처리되지 않은 예외 발생: %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "서버 내부 오류가 발생했습니다."})
+
+
+@app.get("/health")
+def health_check():
+    """docker-compose healthcheck 및 배포 환경의 liveness probe용 엔드포인트."""
+    return {"status": "ok"}
+
+
 class TrendRow(BaseModel):
     date: str
     group_name: str
@@ -230,11 +254,9 @@ async def fetch_naver_trend(keywords: list, days: int = 30) -> list[dict]:
                         {"date": point["period"], "group_name": name, "ratio": point["ratio"]}
                     )
         except httpx.HTTPStatusError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"네이버 검색어 트렌드 API 오류: {exc.response.status_code} {exc.response.text}",
-            )
+            _raise_naver_error("검색어 트렌드", exc)
         except httpx.RequestError as exc:
+            logger.error("네이버 검색어 트렌드 API 호출 실패(네트워크): %s", exc)
             raise HTTPException(status_code=502, detail=f"네이버 검색어 트렌드 API 호출 실패: {exc}")
 
         # 2) 쇼핑인사이트 (카테고리 내 키워드 트렌드)
@@ -250,14 +272,34 @@ async def fetch_naver_trend(keywords: list, days: int = 30) -> list[dict]:
                         {"date": point["period"], "group_name": name, "ratio": point["ratio"]}
                     )
         except httpx.HTTPStatusError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"네이버 쇼핑인사이트 API 오류: {exc.response.status_code} {exc.response.text}",
-            )
+            _raise_naver_error("쇼핑인사이트", exc)
         except httpx.RequestError as exc:
+            logger.error("네이버 쇼핑인사이트 API 호출 실패(네트워크): %s", exc)
             raise HTTPException(status_code=502, detail=f"네이버 쇼핑인사이트 API 호출 실패: {exc}")
 
     return results
+
+
+def _raise_naver_error(api_name: str, exc: httpx.HTTPStatusError) -> NoReturn:
+    """
+    네이버 API 오류 응답을 로깅하고, 호출자가 원인을 구분할 수 있도록
+    적절한 상태 코드의 HTTPException으로 변환해 던진다.
+    - 429 (Rate Limit 초과): 경고 로그 + 429 그대로 전달 (호출자가 재시도 가능함을 알 수 있도록)
+    - 그 외: 에러 로그 + 502 (업스트림 오류)
+    """
+    status_code = exc.response.status_code
+    body = exc.response.text
+    if status_code == 429:
+        logger.warning("네이버 %s API Rate Limit 초과(429): %s", api_name, body)
+        raise HTTPException(
+            status_code=429,
+            detail=f"네이버 {api_name} API 호출 한도를 초과했습니다. 잠시 후 다시 시도하세요.",
+        )
+    logger.error("네이버 %s API 오류(%s): %s", api_name, status_code, body)
+    raise HTTPException(
+        status_code=502,
+        detail=f"네이버 {api_name} API 오류: {status_code} {body}",
+    )
 
 
 async def detect_spike_keywords(
@@ -474,14 +516,20 @@ async def sync_trends():
     if not keywords:
         raise HTTPException(status_code=400, detail="등록된 키워드가 없습니다.")
 
+    logger.info("네이버 트렌드 동기화 시작: 키워드 %d개", len(keywords))
     trend_data = await fetch_naver_trend(keywords, days=30)
 
-    with get_conn() as conn:
-        conn.executemany(
-            "INSERT INTO trends (date, group_name, ratio) VALUES (:date, :group_name, :ratio)",
-            trend_data,
-        )
+    try:
+        with get_conn() as conn:
+            conn.executemany(
+                "INSERT INTO trends (date, group_name, ratio) VALUES (:date, :group_name, :ratio)",
+                trend_data,
+            )
+    except sqlite3.Error as exc:
+        logger.exception("트렌드 데이터 DB 적재 실패")
+        raise HTTPException(status_code=500, detail=f"DB 적재 중 오류가 발생했습니다: {exc}")
 
+    logger.info("네이버 트렌드 동기화 완료: %d건 적재", len(trend_data))
     return {"synced": len(trend_data), "keywords": len(keywords)}
 
 
