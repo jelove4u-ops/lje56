@@ -47,6 +47,7 @@ from typing import Optional
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
@@ -145,6 +146,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="L-Coup Direct API", lifespan=lifespan)
+
+# 로컬 Vite 개발 서버(frontend/)에서 호출할 수 있도록 CORS 허용.
+# FRONTEND_ORIGIN 환경변수로 배포 환경의 실제 오리진을 지정할 수 있다.
+_frontend_origins = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173,http://127.0.0.1:5173")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _frontend_origins.split(",") if o.strip()],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class TrendRow(BaseModel):

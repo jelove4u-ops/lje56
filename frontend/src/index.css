@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@theme {
+  /* Warm charcoal surfaces */
+  --color-charcoal-950: #16130f;
+  --color-charcoal-900: #1c1815;
+  --color-charcoal-800: #24201c;
+  --color-charcoal-700: #2e2822;
+  --color-charcoal-600: #3a322b;
+  --color-charcoal-500: #4a4038;
+
+  /* Warm off-white text */
+  --color-cream-50: #f5eee9;
+  --color-cream-300: #c9beb6;
+  --color-cream-500: #8f8479;
+
+  /* LG deep cherry red (brand identity, validated: dark #E23A54 / light #A50034) */
+  --color-brand-red: #e23a54;
+  --color-brand-red-deep: #a50034;
+  --color-brand-red-soft: #e23a5426;
+
+  /* Competitor line (validated pair against brand-red, dark mode) */
+  --color-competitor-blue: #1e86c4;
+  --color-competitor-blue-soft: #1e86c426;
+
+  /* Status (reserved, distinct from categorical slots) */
+  --color-status-good: #34d399;
+  --color-status-warning: #e8793a;
+  --color-status-critical: #ff6b6b;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-charcoal-950);
+  color: var(--color-cream-50);
+  font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-charcoal-900);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-charcoal-600);
+  border-radius: 8px;
+}
