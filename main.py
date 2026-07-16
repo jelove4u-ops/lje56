@@ -6,6 +6,34 @@ FastAPI + sqlite3 + 네이버 데이터랩 API(통합검색어 트렌드 / 쇼�
     pip install -r requirements.txt
     cp .env.example .env   # NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 채우기
     uvicorn main:app --reload
+
+=====================================================================
+Claude 연동 가이드 - 카카오 MCP 알림 브릿지 (사람이 읽는 운영 문서)
+=====================================================================
+이 백엔드는 카카오톡 메시지를 직접 보내지 않는다. 이상 징후를 감지해
+"대기 중인 알림(Pending Alerts)" 큐에 적재하고, GET /api/alerts/pending
+으로 그 목록을 노출할 뿐이다. 실제 발송은 카카오 MCP가 연결된 Claude
+세션(예: 사용자가 명시적으로 구성한 Claude Code 반복 실행/트리거)이
+아래 절차를 수행할 때만 일어난다. 이 주석은 문서일 뿐이며 어떤 Claude
+세션의 동작도 자동으로 트리거하지 않는다 - 실제 폴링/발송 자동화는
+사용자가 별도로 스케줄러(예: Claude Code Routine)를 만들어야 동작한다.
+
+카카오 MCP가 연결된 Claude 세션에서 알림을 처리하려면:
+  1. GET /api/alerts/pending 을 호출해 대기 중인 알림 목록을 확인한다.
+  2. 응답의 "alerts" 배열이 비어있지 않다면, 각 alert마다 카카오 MCP의
+     메시지 발송 도구(예: send_kakaotalk_message)를 호출해 아래 포맷으로
+     사용자 본인에게 카톡을 보낸다.
+
+         🚨 [L-Coup Direct 트렌드 경보]
+         네이버에서 '{category}' 검색량이 전일 대비 {increase_rate}% 급증!
+         쿠팡 기획전 제안 및 광고 입찰가 조정을 검토하세요.
+
+     (각 alert 객체의 message 필드에 이미 이 포맷으로 렌더링된 문자열이
+     들어있으므로 그대로 사용해도 된다.)
+  3. 발송에 성공한 alert는 POST /api/alerts/{id}/ack 를 호출해 상태를
+     'sent'로 표시한다. ack하지 않으면 다음 폴링에서도 계속 pending으로
+     남아있어 중복 발송으로 이어질 수 있다.
+=====================================================================
 """
 
 import asyncio
@@ -13,7 +41,7 @@ import os
 import sqlite3
 import statistics
 from contextlib import asynccontextmanager, contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -51,6 +79,9 @@ SPIKE_BASELINE_DAYS = 14
 SPIKE_MIN_BASELINE_DAYS = 5  # 이 값보다 데이터가 적으면 판정에서 제외
 SPIKE_STD_THRESHOLD = 2.0
 
+# 전일 대비 카테고리 검색 지수 폭증 알림 기준 (%)
+ALERT_INCREASE_THRESHOLD_PCT = 50.0
+
 
 @contextmanager
 def get_conn():
@@ -80,6 +111,22 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category TEXT NOT NULL,
                 keyword TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                alert_date TEXT NOT NULL,
+                today_avg REAL NOT NULL,
+                yesterday_avg REAL NOT NULL,
+                increase_rate REAL NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                UNIQUE(category, alert_date)
             )
             """
         )
@@ -332,6 +379,80 @@ def calculate_yoy(conn: sqlite3.Connection, group_name: str, period_days: int = 
     }
 
 
+def _category_from_group(group_name: str) -> str:
+    """group_name은 'source:category:keyword' 형태이므로 가운데 항목을 추출한다."""
+    parts = group_name.split(":", 2)
+    return parts[1] if len(parts) >= 2 else group_name
+
+
+def detect_daily_category_spikes(threshold_pct: float = ALERT_INCREASE_THRESHOLD_PCT) -> list[dict]:
+    """
+    카테고리별로 가장 최근 두 날짜(전일 vs 당일)의 평균 검색 지수를 비교해
+    전일 대비 threshold_pct% 이상 폭증한 카테고리를 찾아낸다.
+    """
+    with get_conn() as conn:
+        rows = conn.execute("SELECT date, group_name, ratio FROM trends").fetchall()
+
+    by_category_date: dict[str, dict[str, list[float]]] = {}
+    for r in rows:
+        category = _category_from_group(r["group_name"])
+        by_category_date.setdefault(category, {}).setdefault(r["date"], []).append(r["ratio"])
+
+    spikes = []
+    for category, date_map in by_category_date.items():
+        dates = sorted(date_map.keys())
+        if len(dates) < 2:
+            continue
+        latest_date, prev_date = dates[-1], dates[-2]
+        today_avg = statistics.fmean(date_map[latest_date])
+        yesterday_avg = statistics.fmean(date_map[prev_date])
+        if yesterday_avg <= 0:
+            continue
+        increase_rate = (today_avg - yesterday_avg) / yesterday_avg * 100
+        if increase_rate >= threshold_pct:
+            spikes.append(
+                {
+                    "category": category,
+                    "alert_date": latest_date,
+                    "today_avg": round(today_avg, 2),
+                    "yesterday_avg": round(yesterday_avg, 2),
+                    "increase_rate": round(increase_rate, 2),
+                }
+            )
+    return spikes
+
+
+def enqueue_pending_alerts() -> None:
+    """감지된 폭증 카테고리를 alerts 큐에 적재한다 (같은 카테고리/날짜는 중복 적재하지 않음)."""
+    spikes = detect_daily_category_spikes()
+    if not spikes:
+        return
+
+    with get_conn() as conn:
+        for s in spikes:
+            message = (
+                "🚨 [L-Coup Direct 트렌드 경보]\n"
+                f"네이버에서 '{s['category']}' 검색량이 전일 대비 {s['increase_rate']}% 급증!\n"
+                "쿠팡 기획전 제안 및 광고 입찰가 조정을 검토하세요."
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO alerts
+                    (category, alert_date, today_avg, yesterday_avg, increase_rate, message, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    s["category"],
+                    s["alert_date"],
+                    s["today_avg"],
+                    s["yesterday_avg"],
+                    s["increase_rate"],
+                    message,
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+
+
 @app.post("/api/sync")
 async def sync_trends():
     """등록된 키워드 기준으로 최근 30일 네이버 트렌드 데이터를 가져와 DB에 적재한다."""
@@ -440,6 +561,41 @@ def compare_brands(
             },
         ],
     }
+
+
+@app.get("/api/alerts/pending")
+def get_pending_alerts():
+    """
+    전일 대비 검색 지수가 ALERT_INCREASE_THRESHOLD_PCT% 이상 폭증한 카테고리를
+    감지해 alerts 큐에 적재하고, 아직 발송되지 않은(pending) 알림을 반환한다.
+    카카오 MCP 연동 Claude 세션이 이 엔드포인트를 폴링해 알림을 발송한다
+    (파일 상단의 "Claude 연동 가이드" 참고).
+    """
+    enqueue_pending_alerts()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, category, alert_date, today_avg, yesterday_avg,
+                   increase_rate, message, status, created_at
+            FROM alerts
+            WHERE status = 'pending'
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return {"count": len(rows), "alerts": [dict(r) for r in rows]}
+
+
+@app.post("/api/alerts/{alert_id}/ack")
+def ack_alert(alert_id: int):
+    """카카오톡 발송에 성공한 알림을 'sent'로 표시해 중복 발송을 방지한다."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE alerts SET status = 'sent' WHERE id = ? AND status = 'pending'",
+            (alert_id,),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="대기 중인 알림을 찾을 수 없습니다.")
+    return {"id": alert_id, "status": "sent"}
 
 
 if __name__ == "__main__":
