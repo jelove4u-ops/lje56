@@ -8,8 +8,10 @@ FastAPI + sqlite3 + 네이버 데이터랩 API(통합검색어 트렌드 / 쇼�
     uvicorn main:app --reload
 """
 
+import asyncio
 import os
 import sqlite3
+import statistics
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, timedelta
 from typing import Optional
@@ -39,7 +41,15 @@ SEED_KEYWORDS = [
     ("가전", "에어컨"),
     ("가전", "공기청정기"),
     ("가전", "TV"),
+    ("가전", "LG 냉장고"),
+    ("가전", "삼성 냉장고"),
 ]
+
+# 급상승 키워드 판정 기준
+SPIKE_RECENT_DAYS = 3
+SPIKE_BASELINE_DAYS = 14
+SPIKE_MIN_BASELINE_DAYS = 5  # 이 값보다 데이터가 적으면 판정에서 제외
+SPIKE_STD_THRESHOLD = 2.0
 
 
 @contextmanager
@@ -192,6 +202,136 @@ async def fetch_naver_trend(keywords: list, days: int = 30) -> list[dict]:
     return results
 
 
+async def detect_spike_keywords(
+    recent_days: int = SPIKE_RECENT_DAYS,
+    baseline_days: int = SPIKE_BASELINE_DAYS,
+    min_baseline_days: int = SPIKE_MIN_BASELINE_DAYS,
+    threshold: float = SPIKE_STD_THRESHOLD,
+) -> list[dict]:
+    """
+    최근 N일 검색량 평균이 그 이전 baseline_days일 평균 대비
+    '표준편차 threshold배' 이상 급증한 키워드 그룹을 찾아낸다.
+
+    스코어: spike_score = (recent_avg - baseline_mean) / baseline_std
+    baseline_std가 0인데 recent_avg가 baseline_mean보다 크면(완전히 새로 뜬 키워드)
+    표준편차로 나눌 수 없으므로 스코어를 상한값(SPIKE_STD_THRESHOLD의 큰 배수)으로 고정한다.
+    """
+
+    def _analyze() -> list[dict]:
+        with get_conn() as conn:
+            groups = [
+                r["group_name"]
+                for r in conn.execute("SELECT DISTINCT group_name FROM trends").fetchall()
+            ]
+            spikes: list[dict] = []
+            for group_name in groups:
+                rows = conn.execute(
+                    """
+                    SELECT date, AVG(ratio) AS ratio FROM trends
+                    WHERE group_name = ?
+                    GROUP BY date
+                    ORDER BY date ASC
+                    """,
+                    (group_name,),
+                ).fetchall()
+
+                if len(rows) < recent_days + min_baseline_days:
+                    continue
+
+                recent = rows[-recent_days:]
+                baseline = rows[-(recent_days + baseline_days):-recent_days]
+                if len(baseline) < min_baseline_days:
+                    continue
+
+                recent_avg = statistics.fmean(r["ratio"] for r in recent)
+                baseline_values = [r["ratio"] for r in baseline]
+                baseline_mean = statistics.fmean(baseline_values)
+                baseline_std = (
+                    statistics.pstdev(baseline_values) if len(baseline_values) > 1 else 0.0
+                )
+
+                if baseline_std > 0:
+                    spike_score = (recent_avg - baseline_mean) / baseline_std
+                elif recent_avg > baseline_mean:
+                    spike_score = 999.0  # baseline 변동이 없던 키워드가 새로 급등한 경우
+                else:
+                    spike_score = 0.0
+
+                if spike_score >= threshold:
+                    spikes.append(
+                        {
+                            "group_name": group_name,
+                            "recent_avg": round(recent_avg, 2),
+                            "baseline_mean": round(baseline_mean, 2),
+                            "baseline_std": round(baseline_std, 2),
+                            "spike_score": round(spike_score, 2),
+                        }
+                    )
+
+            spikes.sort(key=lambda x: x["spike_score"], reverse=True)
+            return spikes
+
+    return await asyncio.get_event_loop().run_in_executor(None, _analyze)
+
+
+def _period_avg(conn: sqlite3.Connection, group_name: str, start: date, end: date) -> Optional[float]:
+    row = conn.execute(
+        "SELECT AVG(ratio) AS avg_ratio FROM trends WHERE group_name = ? AND date >= ? AND date <= ?",
+        (group_name, start.isoformat(), end.isoformat()),
+    ).fetchone()
+    return row["avg_ratio"]
+
+
+def calculate_period_change(
+    conn: sqlite3.Connection, group_name: str, period_days: int = 30, offset_days: int = 30
+) -> dict:
+    """
+    group_name의 최근 period_days일 평균 검색 지수를, offset_days일 이전의
+    동일 길이 구간과 비교해 증감률(%)을 계산한다.
+    offset_days=30 -> MoM(전월 대비), offset_days=365 -> YoY(전년 대비)
+    """
+    today = date.today()
+    current_start = today - timedelta(days=period_days - 1)
+    current_end = today
+    prev_end = current_start - timedelta(days=offset_days - period_days)
+    prev_start = prev_end - timedelta(days=period_days - 1)
+
+    current_avg = _period_avg(conn, group_name, current_start, current_end)
+    previous_avg = _period_avg(conn, group_name, prev_start, prev_end)
+
+    change_pct = None
+    if current_avg is not None and previous_avg:
+        change_pct = round((current_avg - previous_avg) / previous_avg * 100, 2)
+
+    return {
+        "current_avg": round(current_avg, 2) if current_avg is not None else None,
+        "previous_avg": round(previous_avg, 2) if previous_avg is not None else None,
+        "change_pct": change_pct,
+    }
+
+
+def calculate_mom(conn: sqlite3.Connection, group_name: str, period_days: int = 30) -> dict:
+    """MoM(전월 대비): 최근 30일(M) vs 그 이전 30일(M-1) 평균 검색 지수 비교."""
+    result = calculate_period_change(conn, group_name, period_days=period_days, offset_days=period_days)
+    return {
+        "group_name": group_name,
+        "current_avg": result["current_avg"],
+        "previous_avg": result["previous_avg"],
+        "mom_pct": result["change_pct"],
+    }
+
+
+def calculate_yoy(conn: sqlite3.Connection, group_name: str, period_days: int = 30) -> dict:
+    """YoY(전년 대비): 최근 30일 vs 1년 전 동일 구간 평균 검색 지수 비교."""
+    result = calculate_period_change(conn, group_name, period_days=period_days, offset_days=365)
+    return {
+        "group_name": group_name,
+        "current_avg": result["current_avg"],
+        "yoy_avg": result["previous_avg"],
+        "yoy_pct": result["change_pct"],
+    }
+
+
 @app.post("/api/sync")
 async def sync_trends():
     """등록된 키워드 기준으로 최근 30일 네이버 트렌드 데이터를 가져와 DB에 적재한다."""
@@ -242,6 +382,64 @@ def get_keywords():
     with get_conn() as conn:
         rows = conn.execute("SELECT id, category, keyword FROM keywords").fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/analysis/spikes")
+async def get_spike_keywords():
+    """
+    최근 3일 평균이 이전 14일 평균 대비 표준편차 2배 이상 급증한 키워드 그룹을
+    급증 지수(spike_score) 높은 순으로 반환한다.
+    """
+    spikes = await detect_spike_keywords()
+    return {"count": len(spikes), "spikes": spikes}
+
+
+@app.get("/api/analysis/compare")
+def compare_brands(
+    category: str = Query("가전", description="비교할 키워드의 카테고리"),
+    keyword_a: str = Query("LG 냉장고", description="비교 대상 A 키워드"),
+    keyword_b: str = Query("삼성 냉장고", description="비교 대상 B 키워드"),
+    source: str = Query("search", pattern="^(search|shopping)$", description="search 또는 shopping"),
+):
+    """
+    두 키워드 그룹(예: 'LG 냉장고' vs '삼성 냉장고')의 최근 30일 점유율 스코어와
+    MoM/YoY 변동률을 함께 반환한다.
+    """
+    group_a = f"{source}:{category}:{keyword_a}"
+    group_b = f"{source}:{category}:{keyword_b}"
+
+    with get_conn() as conn:
+        mom_a, yoy_a = calculate_mom(conn, group_a), calculate_yoy(conn, group_a)
+        mom_b, yoy_b = calculate_mom(conn, group_b), calculate_yoy(conn, group_b)
+
+    avg_a = mom_a["current_avg"] or 0.0
+    avg_b = mom_b["current_avg"] or 0.0
+    total = avg_a + avg_b
+    share_a = round(avg_a / total * 100, 2) if total > 0 else None
+    share_b = round(avg_b / total * 100, 2) if total > 0 else None
+
+    return {
+        "category": category,
+        "source": source,
+        "comparison": [
+            {
+                "keyword": keyword_a,
+                "group_name": group_a,
+                "current_avg": mom_a["current_avg"],
+                "share_pct": share_a,
+                "mom_pct": mom_a["mom_pct"],
+                "yoy_pct": yoy_a["yoy_pct"],
+            },
+            {
+                "keyword": keyword_b,
+                "group_name": group_b,
+                "current_avg": mom_b["current_avg"],
+                "share_pct": share_b,
+                "mom_pct": mom_b["mom_pct"],
+                "yoy_pct": yoy_b["yoy_pct"],
+            },
+        ],
+    }
 
 
 if __name__ == "__main__":
