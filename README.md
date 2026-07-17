@@ -14,12 +14,19 @@ FastAPI 백엔드 + React 대시보드 + Docker 패키징.
 cp .env.example .env
 ```
 
-`.env`를 열어 네이버 오픈 API 자격 증명을 채운다 (https://developers.naver.com/apps 에서 발급):
+`.env`를 열어 **NAVER API HUB**(네이버클라우드플랫폼이 중개 운영하는 게이트웨이) 자격 증명을
+채운다 — NCP 콘솔의 [NAVER API HUB](https://www.ncloud.com/product/applicationService/naverApiHub)
+Application에서 발급:
 
 ```
 NAVER_CLIENT_ID=...
 NAVER_CLIENT_SECRET=...
 ```
+
+> `main.py`는 이 값들을 `naveropenapi.apigw.ntruss.com` 게이트웨이에
+> `X-NCP-APIGW-API-KEY-ID`/`X-NCP-APIGW-API-KEY` 헤더로 전달한다. 클래식
+> `developers.naver.com`(오픈API 개발자센터)에서 발급한 Client ID/Secret은
+> 이 게이트웨이에서 통하지 않으니 반드시 API HUB 콘솔에서 발급받은 값을 써야 한다.
 
 이 파일은 `.gitignore`에 등록되어 있어 커밋되지 않는다. `docker-compose.yml`이
 `env_file: .env`로 백엔드 컨테이너에 주입한다.

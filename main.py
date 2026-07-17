@@ -64,8 +64,11 @@ DB_PATH = os.getenv("DB_PATH", "lcoup_direct.db")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
 
-NAVER_SEARCH_TREND_URL = "https://openapi.naver.com/v1/datalab/search"
-NAVER_SHOPPING_KEYWORDS_URL = "https://openapi.naver.com/v1/datalab/shopping/category/keywords"
+# NAVER API HUB(네이버클라우드플랫폼이 중개 운영하는 게이트웨이) 엔드포인트.
+# 클래식 네이버 개발자센터(openapi.naver.com)와는 도메인과 인증 헤더가 다르다 -
+# API HUB에서 발급받은 Client ID/Secret은 openapi.naver.com에서 통하지 않는다.
+NAVER_SEARCH_TREND_URL = "https://naveropenapi.apigw.ntruss.com/datalab/v1/search"
+NAVER_SHOPPING_KEYWORDS_URL = "https://naveropenapi.apigw.ntruss.com/datalab/v1/shopping/category/keywords"
 
 # 가전(전자/컴퓨터) 대분류 쇼핑인사이트 카테고리 코드. 세부 카테고리는
 # 네이버 데이터랩 문서(https://developers.naver.com/docs/serviceapi/datalab/shopping/shopping.md)의
@@ -195,8 +198,8 @@ def naver_headers() -> dict:
             detail="NAVER_CLIENT_ID / NAVER_CLIENT_SECRET가 설정되어 있지 않습니다. .env를 확인하세요.",
         )
     return {
-        "X-Naver-Client-Id": NAVER_CLIENT_ID,
-        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+        "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET,
         "Content-Type": "application/json",
     }
 
